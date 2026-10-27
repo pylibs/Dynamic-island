@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 
+=======
+# Обязательные
+>>>>>>> 5dbc74d (new features)
 PyQt6
 psutil
 winrt-runtime
@@ -11,4 +15,8 @@ winrt-Windows.Media.Control
 requests     
 pycaw         
 comtypes      
+<<<<<<< HEAD
 pywin32       
+=======
+pywin32       
+>>>>>>> 5dbc74d (new features)

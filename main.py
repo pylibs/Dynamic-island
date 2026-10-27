@@ -10,6 +10,13 @@
 - Alt+Space: лаунчер (программы, калькулятор, конвертер валют/единиц, перевод, погода,
   поиск файлов по индексу Windows, таймер, команды, поиск в буфере)
 
+- Режим фокуса: остров сжимается в точку в играх/полноэкранных приложениях и при «Не беспокоить»
+  (ПКМ -> «Режим фокуса»: авто / всегда / выкл; двойной клик по острову: всегда <-> авто)
+- Адаптивная ширина раскрытого острова: подстраивается под длинные названия, строки буфера,
+  текст песни и карточки плагинов (от 440 до W_MAX пикселей)
+- Жесты мыши: колесо = громкость (в раскрытом виде с Ctrl), средняя кнопка = пауза/пуск,
+  боковые кнопки = предыдущий/следующий трек, двойной клик = режим фокуса
+
 ПКМ по острову -> автозапуск / выход.
 """
 import os
@@ -21,6 +28,7 @@ import time
 import html
 import ctypes
 import hashlib
+import json
 import sqlite3
 import asyncio
 import operator
@@ -67,7 +75,7 @@ from PyQt6.QtGui import (QPainter, QColor, QPixmap, QGuiApplication, QPainterPat
                          QFont, QFontMetrics, QLinearGradient, QPen)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
                              QMenu, QFrame, QLineEdit, QListWidget, QListWidgetItem, QScrollArea,
-                             QStackedWidget, QProgressBar, QLayout)
+                             QStackedWidget, QProgressBar, QLayout, QToolTip)
 
 from winrt.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as MediaManager,
@@ -99,6 +107,12 @@ HOTKEY_VK = 0x20               # Space
 W0, H0 = 150, 36     # минимальный свёрнутый размер
 W1 = 440             # ширина раскрытого острова
 TOP_MARGIN = 8
+W_MAX = 600          # максимальная ширина раскрытого острова (адаптивная ширина)
+HOME_FIXED_W = 336   # ширина главной вкладки без текста: поля, обложка, кнопки
+CLIP_FIXED_W = 200   # ширина строки буфера без текста: поля, время, кнопки
+FOCUS_SIZE = 14      # размер «точки» в режиме фокуса
+GESTURES_ON = True   # жесты мыши (средняя/боковые кнопки, двойной клик, Ctrl+колесо)
+SETTINGS_PATH = DATA_DIR / "settings.json"
 
 TEXT_FONT = "Segoe UI Variable Display"
 ICON_FONTS = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
@@ -366,13 +380,22 @@ def set_autostart(on):
 
 
 # --- громкость системы ---
+VOLUME_ERROR = ""   # текст последней ошибки громкости (для подсказки)
+
+
 def _volume_iface():
     device = AudioUtilities.GetSpeakers()
+    # новые версии pycaw возвращают обёртку AudioDevice со свойством EndpointVolume,
+    # старые - сырое COM-устройство с методом Activate
+    ep = getattr(device, "EndpointVolume", None)
+    if ep is not None:
+        return ep
     iface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
     return cast(iface, POINTER(IAudioEndpointVolume))
 
 
 def change_volume(delta_pct):
+    global VOLUME_ERROR
     if not HAVE_VOLUME:
         return None
     try:
@@ -380,8 +403,10 @@ def change_volume(delta_pct):
         cur = v.GetMasterVolumeLevelScalar()
         new = min(1.0, max(0.0, cur + delta_pct / 100))
         v.SetMasterVolumeLevelScalar(new, None)
+        VOLUME_ERROR = ""
         return round(new * 100)
-    except Exception:
+    except Exception as exc:
+        VOLUME_ERROR = f"{type(exc).__name__}: {exc}"
         return None
 
 
@@ -700,7 +725,7 @@ class TimerManager(QObject):
 
 # ====================== Строки списков ======================
 class ClipRow(QFrame):
-    def __init__(self, island, cid, text, ts, pinned, kind, path, label):
+    def __init__(self, island, cid, text, ts, pinned, kind, path, label, text_w=230):
         super().__init__()
         self.island, self.cid, self.text, self.pinned = island, cid, text, pinned
         self.kind, self.path = kind, path
@@ -713,6 +738,7 @@ class ClipRow(QFrame):
         self.setStyleSheet(f"#row{{background:rgba(255,255,255,{22 if pinned else 11});border-radius:12px;}}"
                            "#row:hover{background:rgba(255,255,255,30);}")
 
+        has_thumb = bool(kind == "image" and path and Path(path).exists())
         if kind == "image" and path and Path(path).exists():
             thumb = QLabel()
             thumb.setPixmap(rounded_pixmap(QPixmap(path), 30, 8))
@@ -725,8 +751,9 @@ class ClipRow(QFrame):
             self.setToolTip(shown[:600])
         lab = QLabel()
         lab.setFont(QFont(TEXT_FONT, 10))
-        lab.setText(QFontMetrics(lab.font()).elidedText(shown, Qt.TextElideMode.ElideRight, 225))
-        lab.setFixedWidth(230)
+        avail = max(120, text_w - (38 if has_thumb else 0))
+        lab.setText(QFontMetrics(lab.font()).elidedText(shown, Qt.TextElideMode.ElideRight, avail - 5))
+        lab.setFixedWidth(avail)
         lay.addWidget(lab)
         lay.addStretch()
         t = QLabel(datetime.datetime.fromtimestamp(ts).strftime("%H:%M"))
@@ -1314,6 +1341,33 @@ class PluginManager(QObject):
         return out[:4]
 
 
+def load_settings():
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def focus_system_state():
+    """True, если Windows считает, что отвлекать нельзя: полноэкранное приложение или игра,
+    режим презентации, «Помощник по фокусировке» (не беспокоить)."""
+    try:
+        state = ctypes.c_int(0)
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+            return False
+        return state.value in (2, 3, 4, 6, 7)
+    except Exception:
+        return False
+
+
 class Island(QWidget):
     def __init__(self):
         super().__init__(None, Qt.WindowType.FramelessWindowHint
@@ -1364,6 +1418,16 @@ class Island(QWidget):
         self._rec_stop_t0 = 0.0
         self.plugins = PluginManager(self)
         self.plug_labels = []
+        self.settings = load_settings()
+        self.focus_pref = self.settings.get("focus", "auto")   # auto | on | off
+        if self.focus_pref not in ("auto", "on", "off"):
+            self.focus_pref = "auto"
+        self.focus_active = False
+        self._title_full = None
+        self._artist_full = None
+        self._clip_need_w = W1
+        self._lyrics_need_w = W1
+        self._plug_need_w = W1
 
         self._build_ui()
         self.setGeometry(self._rect_for(W0, H0))
@@ -1391,7 +1455,8 @@ class Island(QWidget):
 
         self.cb.dataChanged.connect(self._on_clip_changed)
         self.dm.changed.connect(self._on_data_change)
-        self.dm.file_done.connect(lambda name, folder: self.toast.show_toast(name, folder))
+        self.dm.file_done.connect(
+            lambda name, folder: None if self.focus_active else self.toast.show_toast(name, folder))
         self.timers.changed.connect(self._on_timers_changed)
         self.timers.finished.connect(self._on_timer_finished)
 
@@ -1415,6 +1480,11 @@ class Island(QWidget):
         self.privacy_timer.start(1500)
         QTimer.singleShot(300, self._poll_privacy)
 
+        self.focus_timer = QTimer(self)
+        self.focus_timer.timeout.connect(self._update_focus)
+        self.focus_timer.start(2000)
+        QTimer.singleShot(500, self._update_focus)
+
         self.plugin_timer = QTimer(self)
         self.plugin_timer.timeout.connect(self._poll_plugins)
         self.plugin_timer.start(1000)
@@ -1423,6 +1493,8 @@ class Island(QWidget):
         self.watchdog = QTimer(self)
         self.watchdog.timeout.connect(self._watchdog)
         self.watchdog.start(800)
+
+        QApplication.instance().installEventFilter(self)   # жесты мыши
 
     def _watchdog(self):
         if not self.expanded or time.time() < self._keep_open_until:
@@ -1710,7 +1782,7 @@ class Island(QWidget):
         if idx == TAB_CLIP:
             self.refresh_clips()
         if self.expanded and animate:
-            self._animate_to(W1, self._tab_height(idx))
+            self._animate_to(self._open_width(idx), self._tab_height(idx))
 
     # ---------- геометрия и анимация ----------
     def _rect_for(self, w, h):
@@ -1730,7 +1802,7 @@ class Island(QWidget):
 
     def expand(self):
         self.expanded = True
-        self._animate_to(W1, self._tab_height(self.stack.currentIndex()))
+        self._relayout_open()
         QTimer.singleShot(110, lambda: self.full.setVisible(self.expanded))
 
     def collapse(self):
@@ -1741,7 +1813,7 @@ class Island(QWidget):
         self.stack.setCurrentIndex(TAB_HOME)
         for i, b in enumerate(self.tab_btns):
             b.setChecked(i == TAB_HOME)
-        self._animate_to(self._target_w(), H0)
+        self._animate_to(*self._compact_size())
 
     def show_plugins(self, seconds=None):
         self.collapse_timer.stop()
@@ -1783,6 +1855,14 @@ class Island(QWidget):
         act.setChecked(autostart_enabled())
         act.triggered.connect(lambda on: self._toggle_autostart(on))
         menu.addSeparator()
+        fmenu = menu.addMenu("Режим фокуса")
+        for key, label in (("auto", "Авто (игры, «Не беспокоить»)"),
+                           ("on", "Всегда включён"), ("off", "Выключен")):
+            fa = fmenu.addAction(label)
+            fa.setCheckable(True)
+            fa.setChecked(self.focus_pref == key)
+            fa.triggered.connect(lambda _=False, k=key: self._set_focus_pref(k))
+        menu.addSeparator()
         menu.addAction("Остановить запись экрана" if self.rec_proc else "Начать запись экрана",
                        self.toggle_recording)
         menu.addAction("Папка записей", lambda: self._open_dir(RECORD_DIR))
@@ -1801,20 +1881,77 @@ class Island(QWidget):
         except Exception:
             self.flash_msg("Не удалось изменить автозапуск")
 
+    # ---------- жесты мыши ----------
+    def eventFilter(self, obj, ev):
+        """Жесты ловятся на уровне приложения, поэтому не зависят от того,
+        какой дочерний виджет сейчас под курсором."""
+        if not GESTURES_ON:
+            return False
+        t = ev.type()
+        if t != QEvent.Type.MouseButtonPress and t != QEvent.Type.Wheel:
+            return False
+        if not isinstance(obj, QWidget) or not (obj is self or self.isAncestorOf(obj)):
+            return False
+        if t == QEvent.Type.Wheel:
+            ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if self.expanded and not ctrl:
+                return False   # в раскрытом виде обычное колесо прокручивает списки
+            self._wheel_volume(ev.angleDelta().y())
+            return True
+        return self._gesture_button(ev.button())
+
+    def _gesture_hint(self, text):
+        QToolTip.showText(QCursor.pos(), text, self)
+
+    def _gesture_button(self, b):
+        if b == Qt.MouseButton.MiddleButton:
+            if self.has_media:
+                self.media.command("toggle")
+                self._gesture_hint("⏯ Пауза / пуск")
+            else:
+                self._gesture_hint("Ничего не играет")
+        elif b == Qt.MouseButton.BackButton:
+            self.media.command("prev")
+            self._gesture_hint("⏮ Предыдущий трек")
+        elif b == Qt.MouseButton.ForwardButton:
+            self.media.command("next")
+            self._gesture_hint("⏭ Следующий трек")
+        else:
+            return False
+        return True
+
+    def mouseDoubleClickEvent(self, e):
+        if GESTURES_ON and e.button() == Qt.MouseButton.LeftButton:
+            self._set_focus_pref("auto" if self.focus_pref == "on" else "on")
+            e.accept()
+        else:
+            super().mouseDoubleClickEvent(e)
+
     # ---------- громкость (колесо мыши) ----------
-    def wheelEvent(self, e):
-        if self.expanded or not HAVE_VOLUME:
-            super().wheelEvent(e)
+    def _wheel_volume(self, delta):
+        if delta == 0:
             return
-        step = 4 if e.angleDelta().y() > 0 else -4
-        pct = change_volume(step)
+        if not HAVE_VOLUME:
+            self._gesture_hint("Громкость недоступна: pip install pycaw comtypes")
+            return
+        pct = change_volume(4 if delta > 0 else -4)
         if pct is None:
+            self._gesture_hint("Не удалось изменить громкость\n" + VOLUME_ERROR[:120])
+            return
+        if self.expanded:
+            self._gesture_hint(f"Громкость {pct}%")
             return
         self.vol_pct = pct
         self.vol_show = True
         self._resize_compact()
         self.update()
         self.vol_timer.start(1100)
+
+    def wheelEvent(self, e):
+        if self.expanded:
+            super().wheelEvent(e)
+        else:
+            self._wheel_volume(e.angleDelta().y())
 
     def _hide_volume(self):
         self.vol_show = False
@@ -1827,8 +1964,7 @@ class Island(QWidget):
         visible = self.show_progress and self.media_dur > 1
         self.seekbar.setVisible(visible)
         self.btn_chevron.setText("\uE70E" if self.show_progress else "\uE70D")
-        if self.expanded:
-            self._animate_to(W1, self._tab_height(self.stack.currentIndex()))
+        self._relayout_open()
 
     def current_position(self):
         if not self.playing:
@@ -1876,7 +2012,87 @@ class Island(QWidget):
 
     def _resize_compact(self):
         if not self.expanded:
-            self._animate_to(self._target_w(), H0)
+            self._animate_to(*self._compact_size())
+
+    def _compact_size(self):
+        """Размер свёрнутого острова: точка в режиме фокуса, иначе по содержимому."""
+        if self.focus_active and not self.vol_show and not self.flash:
+            return FOCUS_SIZE, FOCUS_SIZE
+        return self._target_w(), H0
+
+    # ---------- адаптивная ширина раскрытого острова ----------
+    def _home_text_need(self):
+        ft = QFontMetrics(self.title.font())
+        fa = QFontMetrics(self.artist.font())
+        t = self._title_full if self._title_full is not None else self.title.text()
+        a = self._artist_full if self._artist_full is not None else self.artist.text()
+        return max(ft.horizontalAdvance(t), fa.horizontalAdvance(a))
+
+    def _open_width(self, idx):
+        sg = QGuiApplication.primaryScreen().geometry()
+        cap = max(W1, min(W_MAX, sg.width() - 80))
+        need = W1
+        if idx == TAB_HOME:
+            need = self._home_text_need() + HOME_FIXED_W + 8
+        elif idx == TAB_CLIP:
+            need = self._clip_need_w
+        elif idx == TAB_LYRICS:
+            need = self._lyrics_need_w
+        elif idx == TAB_PLUGINS:
+            need = self._plug_need_w
+        need = max(W1, need)
+        return int(min(cap, math.ceil(need / 20) * 20))   # шаг 20 px, чтобы остров не «дрожал»
+
+    def _relayout_open(self):
+        if self.expanded:
+            idx = self.stack.currentIndex()
+            self._animate_to(self._open_width(idx), self._tab_height(idx))
+
+    def _apply_media_text(self):
+        if self._title_full is None:
+            return
+        avail = max(104, self._open_width(TAB_HOME) - HOME_FIXED_W - 6)
+        self.title.setText(self.title.fontMetrics().elidedText(
+            self._title_full, Qt.TextElideMode.ElideRight, avail))
+        self.artist.setText(self.artist.fontMetrics().elidedText(
+            self._artist_full, Qt.TextElideMode.ElideRight, avail))
+        self._relayout_open()
+
+    # ---------- режим фокуса ----------
+    def _update_focus(self, announce=False):
+        active = self.focus_pref == "on" or (self.focus_pref == "auto" and focus_system_state())
+        if active != self.focus_active:
+            self.focus_active = active
+            self._resize_compact()
+            self.update()
+        if announce is True:
+            text = {"auto": "Фокус: авто", "on": "Фокус: всегда", "off": "Фокус: выкл"}[self.focus_pref]
+            if self.expanded:
+                QToolTip.showText(QCursor.pos(), text, self)
+            self.flash_msg(text, 1500, force=True)
+
+    def _set_focus_pref(self, pref):
+        self.focus_pref = pref
+        self.settings["focus"] = pref
+        save_settings(self.settings)
+        self._update_focus(announce=True)
+
+    def _paint_focus_dot(self, p, w, h):
+        """В точке остаются только индикаторы: запись экрана, микрофон, камера."""
+        color = None
+        if self.rec_proc is not None:
+            pulse = 0.5 + 0.5 * math.sin(time.time() * 5)
+            color = QColor(255, 59, 48, int(130 + 125 * pulse))
+        elif self.mic_apps:
+            color = QColor(255, 159, 10)
+        elif self.cam_apps:
+            color = QColor(48, 209, 88)
+        if color is None:
+            return
+        d = min(w, h) * 0.4
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QRectF((w - d) / 2, (h - d) / 2, d, d))
 
     def _tick(self):
         if self.rec_proc is not None and not self.expanded:
@@ -1899,6 +2115,10 @@ class Island(QWidget):
         w, h = self.width(), self.height()
         draw_surface(p, w, h, min(h / 2, 34))
         if self.expanded or h > 60:
+            return
+
+        if self.focus_active and not self.vol_show and not self.flash:
+            self._paint_focus_dot(p, w, h)
             return
 
         p.setFont(self.cfont)
@@ -1994,6 +2214,8 @@ class Island(QWidget):
             self.playing = False
             self.title.setText("Ничего не играет")
             self.artist.setText(self._weather_text())
+            self._title_full = self._artist_full = None
+            self._relayout_open()
             self.art.clear()
             self.cover_small = None
             self.last_title = None
@@ -2004,10 +2226,8 @@ class Island(QWidget):
             return
         self.has_media = True
         self.playing = st["playing"]
-        self.title.setText(self.title.fontMetrics().elidedText(
-            st["title"], Qt.TextElideMode.ElideRight, 150))
-        self.artist.setText(self.artist.fontMetrics().elidedText(
-            st["artist"], Qt.TextElideMode.ElideRight, 150))
+        self._title_full, self._artist_full = st["title"], st["artist"]
+        self._apply_media_text()
         self.btn_play.setText("\uE769" if st["playing"] else "\uE768")
 
         self.media_pos = st.get("position", 0.0)
@@ -2273,6 +2493,13 @@ class Island(QWidget):
                 lbl.setProperty("err", err)
                 lbl.setStyleSheet("color: #ff6b6b; background: transparent;" if err
                                   else "color: rgba(255,255,255,150); background: transparent;")
+        fm = QFontMetrics(QFont(TEXT_FONT, 9))
+        longest = 0
+        for _pl, lbl in self.plug_labels:
+            for line in lbl.text().replace("**", "").split("\n"):
+                longest = max(longest, fm.horizontalAdvance(line))
+        self._plug_need_w = longest + 44 + 24 + 16   # поля острова + поля карточки + запас
+        self._relayout_open()
 
     def _poll_plugins(self):
         before = self.plugins.compact_texts(self.has_media)
@@ -2329,6 +2556,8 @@ class Island(QWidget):
         if not lines:
             self.lyrics_status.setText("Текст не найден")
             self.lyrics_list.addStretch()
+            self._lyrics_need_w = W1
+            self._relayout_open()
             return
         self.lyrics_status.setText("")
         for t, text in lines:
@@ -2339,6 +2568,10 @@ class Island(QWidget):
             self.lyrics_list.addWidget(lab)
             self.lyrics_line_labels.append((t, lab))
         self.lyrics_list.addStretch()
+        fm = QFontMetrics(QFont(TEXT_FONT, 11))
+        longest = max((fm.horizontalAdvance(text or "♪") for _, text in lines), default=0)
+        self._lyrics_need_w = int(longest * 1.12) + 44 + 16   # запас под жирную текущую строку
+        self._relayout_open()
 
     def _update_lyrics_highlight(self):
         if self.stack.currentIndex() != TAB_LYRICS or not self.lyrics_line_labels:
@@ -2399,10 +2632,18 @@ class Island(QWidget):
     def refresh_clips(self):
         q = self.clip_search.text().strip()
         rows = self.store.clips(q, self.btn_today.isChecked(), 100)
+        fm = QFontMetrics(QFont(TEXT_FONT, 10))
+        need = 0
+        for _cid, text, _ts, _pn, kind, _path, label in rows:
+            shown = (label or "Изображение") if kind == "image" else " ".join(text.split())[:200]
+            need = max(need, fm.horizontalAdvance(shown) + (38 if kind == "image" else 0))
+        self._clip_need_w = need + CLIP_FIXED_W
+        text_w = self._open_width(TAB_CLIP) - CLIP_FIXED_W
         clear_layout(self.clip_list)
         for cid, text, ts, pinned, kind, path, label in rows:
-            self.clip_list.addWidget(ClipRow(self, cid, text, ts, bool(pinned), kind, path, label))
+            self.clip_list.addWidget(ClipRow(self, cid, text, ts, bool(pinned), kind, path, label, text_w))
         self.clip_list.addStretch()
+        self._relayout_open()
         scope = "за сегодня" if self.btn_today.isChecked() else "за всё время"
         self.clip_info.setText(f"Показано {len(rows)} {scope} · всего в памяти {self.store.clip_total()}"
                                + (" · ищу: " + q if q else ""))
@@ -2518,7 +2759,9 @@ class Island(QWidget):
         self._maybe_collapse()
 
     # ---------- действия ----------
-    def flash_msg(self, text, ms=1600):
+    def flash_msg(self, text, ms=1600, force=False):
+        if self.focus_active and not force:
+            return   # режим фокуса: без всплывающих сообщений
         self.flash = text
         self._resize_compact()
         self.update()
