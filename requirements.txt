@@ -1,6 +1,14 @@
+
 PyQt6
+psutil
 winrt-runtime
 winrt-Windows.Foundation
 winrt-Windows.Foundation.Collections
 winrt-Windows.Storage.Streams
 winrt-Windows.Media.Control
+
+
+requests     
+pycaw         
+comtypes      
+pywin32       
